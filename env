@@ -1,0 +1,5 @@
+MONGO_URL=mongodb+srv://krisjanis:rzik822fmmvhkazc@cluster0.2skla.mongodb.net/carplates
+MINIO_ENDPOINT=localhost
+MINIO_PORT=9000
+RABBITMQ_URL=amqp://rabbitmq
+PORT=3000

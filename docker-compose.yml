@@ -1,0 +1,44 @@
+services:
+
+  app:
+    image: docker:latest
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - MONGO_URL=mongodb+srv://krisjanis:rzik822fmmvhkazc@cluster0.2skla.mongodb.net/carplates
+      - MINIO_ENDPOINT=minio
+      - MINIO_PORT=9000
+      - MINIO_ACCESS_KEY=F4sP84NrktN0PxwMx74n
+      - MINIO_SECRET_KEY=5OKEQlQ4hmph3mO8wzc9P0FUZtKfqFtB7meTF6WW
+      - PORT=3000
+      - OPENALPR_API_URL=http://openalpr:5000
+    depends_on:
+      - rabbitmq
+      - minio
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - app_data:/carplates/tmp
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "8080:15672"
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    volumes:
+      - minio_data:/data
+    ports:
+      - 9000:9000
+      - 9001:9001
+    environment:
+      MINIO_ADDRESS: ':9000'
+      MINIO_CONSOLE_ADDRESS: ':9001'
+    command: minio server /data
+
+volumes:
+  minio_data:
+  app_data:
