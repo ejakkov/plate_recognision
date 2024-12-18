@@ -8,6 +8,7 @@ const { exec } = require('child_process');
 require('dotenv').config();
 const path = require('path');
 const app = express();
+const nodemailer = require('nodemailer'); 
 
 const platesSchema = new mongoose.Schema({
     uuid: { type: String, required: true },
@@ -17,6 +18,16 @@ const platesSchema = new mongoose.Schema({
     plateNumber: { type: String, required: false },
     processingStatus: { type: String, default: 'pending' } 
 });
+
+var transporter = nodemailer.createTransport({
+    service: 'gmail',
+    host: 'smtp.gmail.com',
+    secure: true,
+    auth: {
+      user: 'SEND_FROM_ADDRESS',
+      pass: 'APP_PASSWORD'             // enable 2factor auth on gmail and generate app pass - https://www.youtube.com/watch?v=cqdAS49RthQ&ab_channel=WittCode
+    }
+  });
 
 const File = mongoose.model('File', platesSchema);
 
@@ -70,7 +81,6 @@ app.post('/upload', upload.single('image'), async (req, res) => {
             uploadTime: new Date().toISOString()
         });
         sendToRabbitMQ(queueToALPR,  message);
-
 
         res.status(200).send({
             message: 'File uploaded successfully!',
@@ -142,8 +152,6 @@ async function waitForRabbitMQ(url, retries = 10, delay = 2000) {
 
 async function receiveMessage(queue, fProcessMessage = null) {
     const rabbitMQUrl = 'amqp://rabbitmq';
-    console.log('157');
-
     try {
         // Wait until RabbitMQ is ready
         await waitForRabbitMQ(rabbitMQUrl);
@@ -162,10 +170,12 @@ async function receiveMessage(queue, fProcessMessage = null) {
 
                 channel.consume(queue, (msg) => {
                     console.log(`Received message: ${msg.content.toString()}`);
-                    if (fProcessMessage) {
-                        const msgJson = JSON.parse(msg.content.toString());
+                    const msgJson = JSON.parse(msg.content.toString());
+                    if (fProcessMessage.name === 'processImageFromMinIO') {
                         console.log(msgJson.fileName.toString())
                         fProcessMessage(msgJson.fileName.toString());
+                    } else {
+                        fProcessMessage(msgJson.plate.toString(), msgJson.minutesElapsed.toString())
                     }
                     channel.ack(msg);
                     console.log(`Waiting for messages on ${queue} ...`);
@@ -176,7 +186,6 @@ async function receiveMessage(queue, fProcessMessage = null) {
         console.error(`Failed to connect to RabbitMQ: ${err.message}`);
     }
 }
-
 
 function processImageFromMinIO(fileName) {
     console.log("DIRNAME: ", __dirname)
@@ -245,6 +254,11 @@ async function checkFileInDatabase(fileName, plate) {
     }
 }
 
+async function sendEmail(plate, minutesElapsed, email) {
+
+}
+
+
 async function saveFileToDatabase(fileName, plate) {
     const fileDoc = new File({
         uuid: uuidv4(),
@@ -252,7 +266,7 @@ async function saveFileToDatabase(fileName, plate) {
         fileName: fileName,
         plateNumber: plate,
         uploadTime: new Date(),
-        proceed: false 
+        processingStatus: 'pending'
     });
 
     try {
@@ -264,7 +278,7 @@ async function saveFileToDatabase(fileName, plate) {
 }
 
 receiveMessage(queueToALPR, processImageFromMinIO); 
-
+receiveMessage(queueToDB, checkFileInDatabase);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
