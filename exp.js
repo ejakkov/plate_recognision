@@ -7,7 +7,6 @@ const mongoose = require('mongoose');
 const { exec } = require('child_process');
 require('dotenv').config();
 const path = require('path');
-
 const app = express();
 
 const platesSchema = new mongoose.Schema({
@@ -15,6 +14,7 @@ const platesSchema = new mongoose.Schema({
     originalName: { type: String, required: true },
     fileName: { type: String, required: true },
     uploadTime: { type: Date, default: Date.now },
+    plateNumber: { type: String, required: false },
     processingStatus: { type: String, default: 'pending' } 
 });
 
@@ -27,6 +27,9 @@ const minioClient = new Minio.Client({
     accessKey: 'minioadmin',
     secretKey: 'minioadmin',
 });
+
+const queueToALPR = 'queue_to_alpr';                               // Queue, kas ies no bildes sākotnējās ielādes uz ALPR(Pirms nr. zīmes apstrādes)
+const queueToDB = 'queue_to_db';                                  // Queue, kas ies no ALPR uz datu bāzi(Pēc nr. zīmes apstrādes)
 
 minioClient.makeBucket('licence-plates', '', (err) => {
     if (err) {
@@ -60,19 +63,13 @@ app.post('/upload', upload.single('image'), async (req, res) => {
     const fileName = `${fileUuid}-${originalName}`;
 
     try {
-        const fileDoc = new File({
-            uuid: fileUuid,
-            originalName: originalName,
-            fileName: fileName,
-            processingStatus: 'pending', 
-            uploadTime: new Date()
-        });
-
-        await fileDoc.save();
-
         await uploadToMinio(req.file, fileName);
 
-        sendToRabbitMQ(fileName);
+        const message = JSON.stringify({
+            fileName: fileName,
+            uploadTime: new Date().toISOString()
+        });
+        sendToRabbitMQ(queueToALPR,  message);
 
 
         res.status(200).send({
@@ -101,7 +98,7 @@ async function uploadToMinio(file, fileName) {
     });
 }
 
-function sendToRabbitMQ(fileName) {
+function sendToRabbitMQ(queue, message) {
     amqp.connect('amqp://rabbitmq', (error0, connection) => {
         if (error0) {
             console.error('RabbitMQ connection error:', error0);
@@ -116,17 +113,70 @@ function sendToRabbitMQ(fileName) {
 
             channel.assertQueue(queue, { durable: false });
 
-            const message = JSON.stringify({
-                fileName: fileName,
-                uploadTime: new Date().toISOString()
-            });
-
             channel.sendToQueue(queue, Buffer.from(message));
             console.log(`Sent message to RabbitMQ: ${message}`);
-            processImageFromMinIO(fileName);
         });
     });
 }
+
+async function waitForRabbitMQ(url, retries = 10, delay = 2000) {
+    return new Promise((resolve, reject) => {
+        const tryConnect = (attemptsLeft) => {
+            amqp.connect(url, (err, connection) => {
+                if (err) {
+                    if (attemptsLeft <= 0) {
+                        reject(new Error('RabbitMQ is not ready'));
+                    } else {
+                        console.log(`RabbitMQ not ready yet, retrying in ${delay}ms...`);
+                        setTimeout(() => tryConnect(attemptsLeft - 1), delay);
+                    }
+                } else {
+                    connection.close();
+                    resolve();
+                }
+            });
+        };
+        tryConnect(retries);
+    });
+}
+
+async function receiveMessage(queue, fProcessMessage = null) {
+    const rabbitMQUrl = 'amqp://rabbitmq';
+    console.log('157');
+
+    try {
+        // Wait until RabbitMQ is ready
+        await waitForRabbitMQ(rabbitMQUrl);
+
+        amqp.connect(rabbitMQUrl, (error0, connection) => {
+            if (error0) {
+                throw error0;
+            }
+
+            connection.createChannel((error1, channel) => {
+                if (error1) {
+                    throw error1;
+                }
+
+                channel.assertQueue(queue, { durable: false });
+
+                channel.consume(queue, (msg) => {
+                    console.log(`Received message: ${msg.content.toString()}`);
+                    if (fProcessMessage) {
+                        const msgJson = JSON.parse(msg.content.toString());
+                        console.log(msgJson.fileName.toString())
+                        fProcessMessage(msgJson.fileName.toString());
+                    }
+                    channel.ack(msg);
+                    console.log(`Waiting for messages on ${queue} ...`);
+                });
+            });
+        });
+    } catch (err) {
+        console.error(`Failed to connect to RabbitMQ: ${err.message}`);
+    }
+}
+
 
 function processImageFromMinIO(fileName) {
     console.log("DIRNAME: ", __dirname)
@@ -172,18 +222,18 @@ async function checkFileInDatabase(fileName, plate) {
         const existingFile = await File.findOne({ plateNumber: plate });
 
         if (existingFile) {
-            if (existingFile.proceed) {
+            if (existingFile.processingStatus === 'done') {
                 // car is marked as left the parking lot, so mark it as back in
-                existingFile.proceed = false; 
+                existingFile.processingStatus = 'pending'; 
                 existingFile.uploadTime = new Date(); 
                 await existingFile.save();
                 console.log(`Plate ${plate} marked as back in parking lot.`);
-            } else {
+            } else if (existingFile.processingStatus === 'pending') {
                 // car is already in parking lot, calculate time elapsed
                 const timeElapsed = Date.now() - new Date(existingFile.uploadTime).getTime();
                 const minutesElapsed = Math.floor(timeElapsed / (1000 * 60)); // In minutes
                 console.log(`Plate ${plate} already exists. Time elapsed since upload: ${minutesElapsed} minutes`);
-                existingFile.proceed = true;
+                existingFile.processingStatus = 'done';
                 await existingFile.save();
             }
         } else {
@@ -212,6 +262,8 @@ async function saveFileToDatabase(fileName, plate) {
         console.error('Error saving file with plate number:', err);
     }
 }
+
+receiveMessage(queueToALPR, processImageFromMinIO); 
 
 
 const PORT = process.env.PORT || 3000;
