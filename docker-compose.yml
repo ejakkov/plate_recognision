@@ -42,3 +42,4 @@ services:
 volumes:
   minio_data:
   app_data:
+    name: alpr_bildites_makoniti
