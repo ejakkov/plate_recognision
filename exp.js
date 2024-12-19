@@ -19,15 +19,15 @@ const platesSchema = new mongoose.Schema({
     processingStatus: { type: String, default: 'pending' } 
 });
 
-var transporter = nodemailer.createTransport({
+const transporter = nodemailer.createTransport({
     service: 'gmail',
     host: 'smtp.gmail.com',
     secure: true,
     auth: {
-      user: 'SEND_FROM_ADDRESS',
-      pass: 'APP_PASSWORD'             // enable 2factor auth on gmail and generate app pass - https://www.youtube.com/watch?v=cqdAS49RthQ&ab_channel=WittCode
+        user: 'kdzenis27@gmail.com',
+        pass: ''       
     }
-  });
+});
 
 const File = mongoose.model('File', platesSchema);
 
@@ -69,6 +69,12 @@ app.post('/upload', upload.single('image'), async (req, res) => {
         return res.status(400).send({ error: 'No file uploaded' });
     }
 
+    global.email = req.body.email;
+
+    if (!email) {
+        return res.status(400).send({ error: 'No receiver email provided' });
+    }
+
     const fileUuid = uuidv4();
     const originalName = req.file.originalname;
     const fileName = `${fileUuid}-${originalName}`;
@@ -78,7 +84,8 @@ app.post('/upload', upload.single('image'), async (req, res) => {
 
         const message = JSON.stringify({
             fileName: fileName,
-            uploadTime: new Date().toISOString()
+            uploadTime: new Date().toISOString(),
+            email: email
         });
         sendToRabbitMQ(queueToALPR,  message);
 
@@ -86,7 +93,8 @@ app.post('/upload', upload.single('image'), async (req, res) => {
             message: 'File uploaded successfully!',
             fileUuid: fileUuid,
             originalName: originalName,
-            fileName: fileName
+            fileName: fileName,
+            email: email
         });
     } catch (err) {
         console.error('Error handling upload:', err);
@@ -174,8 +182,8 @@ async function receiveMessage(queue, fProcessMessage = null) {
                     if (fProcessMessage.name === 'processImageFromMinIO') {
                         console.log(msgJson.fileName.toString())
                         fProcessMessage(msgJson.fileName.toString());
-                    } else {
-                        fProcessMessage(msgJson.plate.toString(), msgJson.minutesElapsed.toString())
+                    } else if (fProcessMessage === checkFileInDatabase)  {
+                        fProcessMessage(msgJson.fileName, msgJson.plate)
                     }
                     channel.ack(msg);
                     console.log(`Waiting for messages on ${queue} ...`);
@@ -188,7 +196,6 @@ async function receiveMessage(queue, fProcessMessage = null) {
 }
 
 function processImageFromMinIO(fileName) {
-    console.log("DIRNAME: ", __dirname)
     minioClient.fGetObject('licence-plates', fileName, path.join(__dirname, `/tmp/${fileName}`), (err, dataStream) => {
         if (err) {
             console.error('Error fetching file from MinIO:', err);
@@ -196,7 +203,7 @@ function processImageFromMinIO(fileName) {
         }
     })
 
-    const alprCommand = `docker run --rm -i -v makonis_app_data:/data openalpr/openalpr -c eu ${fileName}`;
+    const alprCommand = `docker run --rm -i -v alpr_bildites_makoniti:/data openalpr/openalpr -c eu ${fileName}`;
     console.log(`Running OpenALPR with command: ${alprCommand}`);
 
     exec(alprCommand, (error, stdout, stderr) => {
@@ -218,7 +225,12 @@ function processImageFromMinIO(fileName) {
         if (match) {
             const plate = match.match(plateRegex)[1];
             console.log(`Detected License Plate: ${plate}`);
-            checkFileInDatabase(fileName, plate);
+            const message = JSON.stringify({
+                fileName: fileName,
+                plate: plate
+            });
+
+            sendToRabbitMQ(queueToDB, message);
         } else {
             console.log('No valid license plate detected.');
         }
@@ -244,6 +256,7 @@ async function checkFileInDatabase(fileName, plate) {
                 console.log(`Plate ${plate} already exists. Time elapsed since upload: ${minutesElapsed} minutes`);
                 existingFile.processingStatus = 'done';
                 await existingFile.save();
+                await sendEmail(email, plate, minutesElapsed); 
             }
         } else {
             console.log(`Plate ${plate} not found in database. Saving as new entry.`);
@@ -254,8 +267,20 @@ async function checkFileInDatabase(fileName, plate) {
     }
 }
 
-async function sendEmail(plate, minutesElapsed, email) {
+async function sendEmail(to, plate, minutesElapsed) {
+    const mailOptions = {
+        from: 'kdzenis27@gmail.com',
+        to: to,
+        subject: 'Stāvvietas ziņojums',
+        text: `Transportlīdzeklis ar numurzīmi: ${plate}\n Stāvvietā pavadītais laiks: ${minutesElapsed} minūtes`
+    };
 
+    try {
+        const info = await transporter.sendMail(mailOptions);
+        console.log('Email sent: ' + info.response);
+    } catch (error) {
+        console.error('Error sending email:', error);
+    }
 }
 
 
